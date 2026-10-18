@@ -140,6 +140,40 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    // MoE expert streaming, enabled with GGML_MOE_STREAM_MIB=<RAM cache size>: the experts of mmapped MUL_MAT_ID weights
+    // are cached in anonymous memory and the missing ones are read with O_DIRECT (see ggml-cpu/moe-stream.cpp)
+    GGML_BACKEND_API bool ggml_moe_stream_enabled(void);
+
+    // for MUL_MAT_ID on another device: passes the experts of w with counts[e] > 0 (tokens routed to e) to set(), from the RAM cache or read
+    // from the file, and keeps the most used ones in the cache; sync() must wait until the data passed to set() has been copied
+    // returns false if w is not streamed
+    GGML_BACKEND_API bool ggml_moe_stream_copy(const struct ggml_tensor * w, const int32_t * counts,
+            void (*set)(void * ctx, size_t offset, const void * data, size_t size), void (*sync)(void * ctx), void * ctx);
+
+    // the size of all the streamed expert tensors, which sets the share of the experts of a large batch that is kept in the cache
+    GGML_BACKEND_API void ggml_moe_stream_set_expert_bytes(size_t n);
+
+    // registers an expert tensor (blk.N.ffn_{gate,up,down}_exps), so that the copy of a layer's first weight can plan the reads of all three
+    GGML_BACKEND_API void ggml_moe_stream_register(const struct ggml_tensor * w);
+
+    // whether w was registered and is streamed from its file (its MUL_MAT_IDs can use ggml_moe_stream_copy)
+    GGML_BACKEND_API bool ggml_moe_stream_is_streamed(const struct ggml_tensor * w);
+
+    // the staging buffers of ggml_moe_stream_copy (up to 256), for the user to pin them; returns their number
+    GGML_BACKEND_API int ggml_moe_stream_staging(void ** bufs, size_t * size);
+
+    // lookahead: start reading the experts of ws (the expert tensors of one layer) selected by the I32 ids, without waiting
+    GGML_BACKEND_API void ggml_moe_stream_hint(const struct ggml_tensor * const * ws, int n_ws, const struct ggml_tensor * ids);
+
+    // the same for the experts of the layer after next, a less accurate guess that is evicted first if unused
+
+    // hybrid MoE: map[e] >= 0 means that expert e of w is computed on another device, so the CPU MUL_MAT_ID skips it (zero output) and
+    // the cache neither reads nor keeps it; map (n_expert int32, owned by the caller) may only change between graph computations
+    GGML_BACKEND_API void ggml_moe_stream_set_gpu_map(const struct ggml_tensor * w, const int32_t * map);
+
+    // copies expert e of w (size bytes) to dst if it is in the RAM cache and read, returns false otherwise
+    GGML_BACKEND_API bool ggml_moe_stream_get_cached(const struct ggml_tensor * w, int64_t e, void * dst, size_t size);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);

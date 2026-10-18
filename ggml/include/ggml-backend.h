@@ -343,6 +343,16 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the compute buffer of a backend (NULL if it is split into chunks), and the end of what the last allocated graph uses in it
+    GGML_API ggml_backend_buffer_t      ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API size_t                     ggml_backend_sched_get_buffer_hwm(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // the next reserve allocates the compute buffer of backend with at least size bytes
+    GGML_API void                       ggml_backend_sched_set_buffer_min_size(ggml_backend_sched_t sched, ggml_backend_t backend, size_t size);
+
+    // weights in host memory that a backend reads itself (e.g. streams to the device) instead of the scheduler copying them:
+    // called for the src0 of an offloaded MUL_MAT_ID, returning true keeps the host tensor as its source
+    typedef bool (*ggml_backend_sched_stream_weight_t)(const struct ggml_tensor * w, void * user_data);
+    GGML_API void                       ggml_backend_sched_set_stream_weight_callback(ggml_backend_sched_t sched, ggml_backend_sched_stream_weight_t cb, void * user_data);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

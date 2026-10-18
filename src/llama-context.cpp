@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -8,6 +9,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-kv-cache.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
@@ -422,6 +424,20 @@ llama_context::llama_context(
                 }
             }
 
+            // VRAM manager (LLAMA_VRAM_MANAGER=1, see llama-moe-vram): the device compute buffer is lazily backed, prompt batches map
+            // all of it, generation only what its graphs use
+            static const bool vram_manager = getenv("LLAMA_VRAM_MANAGER") != nullptr && atoi(getenv("LLAMA_VRAM_MANAGER")) != 0;
+            if (vram_manager && backend_type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                auto lazy_buft = (ggml_backend_buffer_type_t (*)(int)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                    "ggml_backend_cuda_lazy_buffer_type");
+                int dev_id = 0;
+                sscanf(ggml_backend_dev_name(dev), "CUDA%d", &dev_id);
+                if (lazy_buft && lazy_buft(dev_id)) {
+                    buft = lazy_buft(dev_id);
+                }
+            }
+
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
@@ -480,7 +496,81 @@ llama_context::llama_context(
             }
         }
 
+        // adaptive ubatch: LLAMA_UBATCH_MIN=n lets prompt ubatches grow up to n_ubatch while the context is short,
+        // within the compute memory that ubatches of n tokens need at the full context
+        if (const char * s = getenv("LLAMA_UBATCH_MIN")) {
+            const uint32_t n_min = (uint32_t) atoi(s);
+            if (n_min > 0 && n_min < cparams.n_ubatch) {
+                llama_adaptive_ubatch_params.n_min  = n_min;
+                llama_adaptive_ubatch_params.budget = (uint64_t) n_min*cparams.n_ctx;
+                const char * tf = getenv("LLAMA_UBATCH_TEXT_FULL");
+                llama_adaptive_ubatch_params.text_full = tf != nullptr && atoi(tf) != 0;
+                const char * tc = getenv("LLAMA_UBATCH_TEXT_CTX");
+                llama_adaptive_ubatch_params.text_ctx  = tc != nullptr ? (uint32_t) atoi(tc) : 0;
+                // the chunks of the sparse attention are sized for the batches that run at depth
+                const uint32_t n_deep = llama_adaptive_ubatch_params.text_ctx > 0 && cparams.n_ubatch/2 >= n_min ? cparams.n_ubatch/2 : cparams.n_ubatch;
+                llama_adaptive_ubatch_params.kv_ref    = (uint32_t) (llama_adaptive_ubatch_params.budget / n_deep);
+                LLAMA_LOG_INFO("%s: adaptive ubatch: %u..%u tokens, ubatch x cells <= %llu%s, text batches of %u beyond %u cells\n", __func__,
+                        n_min, cparams.n_ubatch, (unsigned long long) llama_adaptive_ubatch_params.budget,
+                        llama_adaptive_ubatch_params.text_full ? " (embeddings only; token batches up to the full ubatch at any depth)" : "",
+                        n_deep, llama_adaptive_ubatch_params.text_ctx);
+            }
+        }
+
+        if (ggml_moe_stream_enabled()) {
+            size_t expert_bytes = 0;
+            for (const auto & layer : model.layers) {
+                for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                    if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                        expert_bytes += ggml_nbytes(t);
+                        ggml_moe_stream_register(t);
+                    }
+                }
+            }
+            ggml_moe_stream_set_expert_bytes(expert_bytes);
+
+            // pinned staging buffers make the uploads of large batches asynchronous
+            void * bufs[256];
+            size_t buf_size = 0;
+            const int n_bufs = ggml_moe_stream_staging(bufs, &buf_size);
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                auto reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_register_host_buffer");
+                if (reg_fn != nullptr) {
+                    int n_ok = 0;
+                    for (int b = 0; b < n_bufs; ++b) {
+                        n_ok += reg_fn(bufs[b], buf_size) ? 1 : 0;
+                    }
+                    fprintf(stderr, "%s: pinned %d of %d MoE streaming staging buffers\n", __func__, n_ok, n_bufs);
+                }
+                break;
+            }
+            LLAMA_LOG_INFO("%s: MoE expert streaming of %.2f MiB of host experts\n", __func__, expert_bytes/1024.0/1024.0);
+        }
+
         sched_reserve();
+
+        // hybrid MoE (LLAMA_MOE_VRAM_MIB=<device cache size>), see llama-moe-vram.h; the banks take the end of the device compute buffer,
+        // or with the VRAM manager (LLAMA_VRAM_MANAGER=1) a lazily backed buffer of up to that size
+        // (not in an MTP draft context: the target context's instance owns the device memory and manages the draft's buffers too)
+        if (const char * s = getenv("LLAMA_MOE_VRAM_MIB"); s != nullptr && atoll(s) > 0 && !model.hparams.no_alloc &&
+                cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const bool shared = !(getenv("LLAMA_VRAM_MANAGER") != nullptr && atoi(getenv("LLAMA_VRAM_MANAGER")) != 0);
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    ggml_backend_buffer_t buf = shared ? ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]) : nullptr;
+                    if (shared && buf == nullptr) {
+                        throw std::runtime_error("hybrid MoE: the device compute buffer is not available");
+                    }
+                    moe_vram = std::make_unique<llama_moe_vram>(model, backend_ptrs[i], backend_buft[i], (size_t) atoll(s) << 20, buf);
+                    break;
+                }
+            }
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -661,6 +751,16 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
+    // LLAMA_MOE_PREFILL_STREAM_MIB=<ring size>: the offloaded MUL_MAT_IDs of prompt batches stream the experts themselves (mmid-stream.cu)
+    if (const char * e = getenv("LLAMA_MOE_PREFILL_STREAM_MIB"); e != nullptr && atoll(e) > 0 && ggml_moe_stream_enabled() && !model.hparams.no_alloc) {
+        moe_prefill_ring = (size_t) atoll(e) << 20;
+    }
+    if (moe_prefill_ring > 0) {
+        ggml_backend_sched_set_stream_weight_callback(sched.get(), sched_stream_weight, this);
+    }
+    // the graphs are reserved as they run: streamed experts need no scheduler copies
+    moe_prefill_active = moe_prefill_ring > 0;
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -690,6 +790,28 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // adaptive ubatch: the largest ubatch only sees budget/n_tokens cells, the smallest one sees the whole context
+    const auto & aub = llama_adaptive_ubatch_params;
+    const bool adaptive = aub.n_min > 0 && aub.n_min < n_tokens;
+    auto reserve_pp_min = [&](bool no_alloc) {
+        if (!adaptive) {
+            return true;
+        }
+        llama_kv_cache_reserve_n_kv_cap = 0;
+        llama_memory_context_ptr mctx_min = memory ? memory->init_full() : nullptr;
+        // the smallest ubatch at the full context is what batches of embeddings need, built with their full masks
+        llama_adaptive_ubatch_params.reserve_masks = true;
+        const bool ok = graph_reserve(aub.n_min, n_seqs, std::min(aub.n_min, cparams.n_outputs_max), mctx_min.get(), no_alloc) != nullptr;
+        llama_adaptive_ubatch_params.reserve_masks = false;
+        return ok;
+    };
+    // token batches of the full ubatch at the full context when they build no ubatch x cells tensor (LLAMA_UBATCH_TEXT_FULL)
+    if (adaptive && memory && !aub.text_full) {
+        llama_kv_cache_reserve_n_kv_cap = (uint32_t) std::min<uint64_t>(cparams.n_ctx, aub.budget / n_tokens);
+        mctx = memory->init_full();
+        llama_kv_cache_reserve_n_kv_cap = 0;
+    }
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -700,11 +822,17 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                if (moe_prefill_ring > 0) {
+                    ggml_backend_sched_set_stream_weight_callback(sched.get(), sched_stream_weight, this);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
+        }
+        if (!reserve_pp_min(model.hparams.no_alloc)) {
+            throw std::runtime_error("failed to allocate compute pp buffers for the smallest adaptive ubatch");
         }
 
         n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
@@ -749,6 +877,45 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+        if (!reserve_pp_min(model.hparams.no_alloc)) {
+            throw std::runtime_error("failed to allocate compute pp buffers for the smallest adaptive ubatch");
+        }
+    }
+
+    // the ring of the streamed prompt experts: its own device buffer, allocated once (until 2026-10-15 it took the end of the
+    // compute buffer, and prompt graphs that reached it, deep ones, were built again with the scheduler's copies of the experts;
+    // the VRAM manager kept it mapped anyway, so it cost the same memory)
+    if (moe_prefill_ring > 0 && moe_prefill_gpu == nullptr) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            ggml_backend_t gpu = backend_ptrs[i];
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu));
+            auto set_fn = reg ? (void (*)(void *, void *, size_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_stream_set") : nullptr;
+            moe_prefill_new_graph = reg ? (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_stream_new_graph") : nullptr;
+            if (set_fn == nullptr || moe_prefill_new_graph == nullptr) {
+                throw std::runtime_error("streamed prompt experts need the CUDA backend");
+            }
+            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                // the ring is one per process (mmid-stream.cu): an MTP draft streams through the target context's, which was set up
+                // first; the two never compute at the same time (setting it here would move the target's ring into this buffer)
+                moe_prefill_gpu      = gpu;
+                moe_prefill_active   = true;
+                break;
+            }
+            moe_prefill_ring_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(gpu), moe_prefill_ring));
+            if (!moe_prefill_ring_buf) {
+                throw std::runtime_error("failed to allocate the ring of the streamed prompt experts");
+            }
+            set_fn((void *) &ggml_moe_stream_copy, ggml_backend_buffer_get_base(moe_prefill_ring_buf.get()), moe_prefill_ring, moe_prefill_bufs);
+            moe_prefill_gpu      = gpu;
+            moe_prefill_active   = true;
+            fprintf(stderr, "%s: prompt batches stream the experts through %d buffers of %.1f MiB\n", __func__,
+                moe_prefill_bufs, moe_prefill_ring/1048576.0/moe_prefill_bufs);
+            break;
         }
     }
 
@@ -1422,7 +1589,17 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_DECODE_PROFILE=1 (diagnostic): host time of the phases of single-token decodes, printed every 200
+static struct llama_decode_prof {
+    bool on = getenv("LLAMA_DECODE_PROFILE") != nullptr && atoi(getenv("LLAMA_DECODE_PROFILE")) != 0;
+    int64_t n = 0, n_reused = 0;
+    double apply = 0, reuse = 0, build = 0, inputs = 0, vram = 0, compute = 0, decode_total = 0;
+} g_dprof;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool dprof = g_dprof.on && ubatch.n_tokens == 1;
+    int64_t dp_t = dprof ? ggml_time_us() : 0;
+    auto dp_lap = [&](double & acc) { if (dprof) { const int64_t t = ggml_time_us(); acc += (t - dp_t)/1000.0; dp_t = t; } };
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1435,8 +1612,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    dp_lap(g_dprof.apply);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        dp_lap(g_dprof.reuse);
+        if (dprof) g_dprof.n_reused++;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1473,6 +1653,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        dp_lap(g_dprof.build);
     }
 
     // set the input data for the input tensors
@@ -1484,8 +1665,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    dp_lap(g_dprof.inputs);
 
+    if (moe_vram) {
+        moe_vram->begin_graph(sched.get(), ubatch.n_tokens);
+    } else {
+        // VRAM manager: another context (an MTP draft) has lazily backed device buffers too, the managing instance maps them
+        static const bool vram_manager = getenv("LLAMA_VRAM_MANAGER") != nullptr && atoi(getenv("LLAMA_VRAM_MANAGER")) != 0;
+        if (vram_manager) {
+            for (ggml_backend_t b : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    const char * mb = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+                    llama_moe_vram::manage_other(sched.get(), b, ubatch.n_tokens, 0, 0, mb ? atoi(mb) : 32);
+                    break;
+                }
+            }
+        }
+    }
+    dp_lap(g_dprof.vram);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    dp_lap(g_dprof.compute);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2624,6 +2823,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_vram    =*/ moe_vram.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2652,6 +2852,9 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+    if (moe_prefill_new_graph) {
+        moe_prefill_new_graph();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2661,6 +2864,11 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::sched_stream_weight(const ggml_tensor * w, void * user_data) {
+    const auto * lctx = static_cast<const llama_context *>(user_data);
+    return lctx->moe_prefill_active && ggml_moe_stream_is_streamed(w);
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -2705,6 +2913,27 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    // MoE expert streaming: the experts come from its RAM cache or are read from the file without the page cache
+    if (ggml_moe_stream_enabled()) {
+        std::vector<int32_t> counts(n_expert, 0);
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                counts[st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)]]++;
+            }
+        }
+        struct set_ctx { ggml_backend_t backend; ggml_tensor * dst; } sc = { backend, dst };
+        auto set = [](void * ctx, size_t offset, const void * data, size_t size) {
+            auto * c = (set_ctx *) ctx;
+            ggml_backend_tensor_set_async(c->backend, c->dst, data, offset, std::min(size, ggml_nbytes(c->dst) - offset));
+        };
+        auto sync = [](void * ctx) {
+            ggml_backend_synchronize(((set_ctx *) ctx)->backend);
+        };
+        if (ggml_moe_stream_copy(src, counts.data(), set, sync, &sc)) {
+            return true;
+        }
     }
 
     // group consecutive experts and copy them together
@@ -4523,7 +4752,24 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    const int64_t dp_t0 = g_dprof.on && batch.n_tokens == 1 ? ggml_time_us() : 0;
     const int ret = ctx->decode(batch);
+    if (dp_t0) {
+        static int64_t last_end = 0;
+        const int64_t t1 = ggml_time_us();
+        g_dprof.decode_total += (t1 - dp_t0)/1000.0;
+        static double outside = 0;
+        if (last_end > 0 && dp_t0 - last_end < 500000) outside += (dp_t0 - last_end)/1000.0;
+        last_end = t1;
+        if (++g_dprof.n % 200 == 0) {
+            const double n = (double) g_dprof.n;
+            fprintf(stderr, "decode_prof: %lld tokens (%lld reused graphs): llama_decode %.3f ms (apply+params %.3f, reuse check %.3f, build+alloc %.3f, set_inputs %.3f, vram %.3f, compute %.3f, rest %.3f), caller between %.3f ms\n",
+                (long long) g_dprof.n, (long long) g_dprof.n_reused, g_dprof.decode_total/n, g_dprof.apply/n, g_dprof.reuse/n, g_dprof.build/n,
+                g_dprof.inputs/n, g_dprof.vram/n, g_dprof.compute/n,
+                (g_dprof.decode_total - g_dprof.apply - g_dprof.reuse - g_dprof.build - g_dprof.inputs - g_dprof.vram - g_dprof.compute)/n,
+                outside/std::max(1.0, n - 1));
+        }
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

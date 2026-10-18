@@ -1503,6 +1503,16 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // ggml_mul_mat_id with the results of the n_expert_used experts of each token weighted by w [1, n_expert_used, n_tokens]
+    // and summed: [as->ne[1], 1, n_tokens]. Only for expert weights streamed to the GPU (ggml-cuda mmid-stream), which sums each
+    // chunk of experts as it is computed instead of keeping every expert's rows (op_params[4] = 1)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * w);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

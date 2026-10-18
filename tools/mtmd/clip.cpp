@@ -27,6 +27,14 @@
 #include <functional>
 #include <float.h>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define CLIP_HAVE_MMAP 1
+#endif
+
 struct clip_logger_state g_logger_state = {clip_log_callback_default, NULL};
 
 //#define CLIP_DEBUG_FUNCTIONS
@@ -158,6 +166,9 @@ struct clip_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
+    // CPU weights: a read-only mapping of the file instead of a copy (MTMD_MMAP=0 copies)
+    void * map_addr = nullptr;
+    size_t map_size = 0;
 
 
     int max_nodes = 8192;
@@ -229,6 +240,12 @@ struct clip_ctx {
     }
 
     ~clip_ctx() {
+        buf.reset();
+#ifdef CLIP_HAVE_MMAP
+        if (map_addr != nullptr) {
+            munmap(map_addr, map_size);
+        }
+#endif
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -3695,6 +3712,55 @@ struct clip_model_loader {
 
             // alloc memory and offload data
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+#ifdef CLIP_HAVE_MMAP
+            // weights on the CPU: map the file instead of copying it into anonymous memory, so that the pages are
+            // reclaimable page cache while no image is being encoded (the CPU vision encoder's ~0.5 GB otherwise sits in
+            // RAM for the life of the server)
+            if (!ctx_clip.no_alloc && ggml_backend_buft_is_host(buft) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(ctx_clip.backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const int fd = open(fname.c_str(), O_RDONLY);
+                struct stat st = {};
+                void * addr = MAP_FAILED;
+                if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 0) {
+                    addr = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                }
+                if (fd >= 0) {
+                    close(fd);
+                }
+                const size_t align = ggml_backend_buft_get_alignment(buft);
+                bool ok = addr != MAP_FAILED;
+                for (auto & t : tensors_to_load) {
+                    auto it_off = tensor_offset.find(t->name);
+                    ok = ok && it_off != tensor_offset.end() && it_off->second % align == 0 &&
+                         it_off->second + ggml_nbytes(t) <= (size_t) st.st_size;
+                }
+                if (ok) {
+                    ctx_clip.map_addr = addr;
+                    ctx_clip.map_size = (size_t) st.st_size;
+                    ctx_clip.buf.reset(ggml_backend_cpu_buffer_from_ptr(addr, (size_t) st.st_size));
+                    ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    for (auto & t : tensors_to_load) {
+                        ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
+                        GGML_ASSERT(cur && "tensor not found in ctx_data");
+                        GGML_ASSERT(ggml_backend_tensor_alloc(ctx_clip.buf.get(), cur, (char *) addr + tensor_offset.at(t->name)) == GGML_STATUS_SUCCESS);
+                    }
+                    // tensors that are not weights from the file (none expected) would be left without data
+                    for (ggml_tensor * cur = ggml_get_first_tensor(ctx_clip.ctx_data.get()); cur; cur = ggml_get_next_tensor(ctx_clip.ctx_data.get(), cur)) {
+                        GGML_ASSERT(cur->data != nullptr && "clip tensor without file data");
+                    }
+                    LOG_INF("%s: mapped %zu tensors from %s (%.1f MiB, CPU, not copied)\n", __func__, tensors_to_load.size(),
+                            fname.c_str(), st.st_size / 1048576.0);
+                    if (progress_callback) {
+                        progress_callback(1.0, progress_callback_user_data);
+                    }
+                    fin.close();
+                    return;
+                }
+                if (addr != MAP_FAILED) {
+                    munmap(addr, (size_t) st.st_size);
+                }
+            }
+#endif
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
@@ -5874,10 +5940,22 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
+    // the scratch pools of the other contexts (e.g. the LLM after a long prompt) may hold the memory the encoder needs
+    static size_t (*trim_pools)(void) = [] {
+        ggml_backend_reg_t cuda = ggml_backend_reg_by_name("CUDA");
+        return cuda ? (size_t (*)(void)) ggml_backend_reg_get_proc_address(cuda, "ggml_backend_cuda_trim_pools") : nullptr;
+    }();
+    if (trim_pools) {
+        trim_pools();
+    }
+
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (trim_pools) {
+        trim_pools();
     }
 
     // the last node is the embedding tensor, code2wav has no out_embd

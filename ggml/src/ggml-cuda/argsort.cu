@@ -30,10 +30,9 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 #ifdef GGML_CUDA_USE_CUB
 
 // returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
-int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
-    // perform argsort in chunks up to approximately this size (currently 64MB)
+int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows, const size_t chunk_bytes) {
+    // perform argsort in chunks up to approximately chunk_bytes (default 64MB)
     // to avoid excessive temporary buffers memory usage
-    const int chunk_bytes = 1 << 26;
 
     // calculate how many rows will fit in one chunk (must be at least one)
     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);

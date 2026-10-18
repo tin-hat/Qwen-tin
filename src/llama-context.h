@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-vram.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -302,6 +303,16 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_moe_vram_ptr  moe_vram;
+
+    // prompt batches stream the MoE experts through a ring in its own device buffer (LLAMA_MOE_PREFILL_STREAM_MIB)
+    size_t moe_prefill_ring = 0;
+    int    moe_prefill_bufs = 3;
+    ggml_backend_buffer_ptr moe_prefill_ring_buf;  // null in an MTP draft context, which streams through the target's
+    bool   moe_prefill_active   = false;   // the next graphs stream (false: the scheduler copies the experts)
+    ggml_backend_t moe_prefill_gpu = nullptr;
+    void (*moe_prefill_new_graph)(void) = nullptr;
+    static bool sched_stream_weight(const ggml_tensor * w, void * user_data);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

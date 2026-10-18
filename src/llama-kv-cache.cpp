@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -218,6 +219,22 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // VRAM manager: reserve the device buffer, back only the cells in use
+            static const bool manager = getenv("LLAMA_VRAM_MANAGER") != nullptr && atoi(getenv("LLAMA_VRAM_MANAGER")) != 0;
+            // (cells are rows of K and V: not with a transposed V cache)
+            if (manager && !v_trans && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                auto lazy_buft = (ggml_backend_buffer_type_t (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_lazy_buffer_type");
+                lazy_map   = (bool (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_map");
+                lazy_unmap = (size_t (*)(ggml_backend_buffer_t, size_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_unmap");
+                int dev_id = 0;
+                sscanf(ggml_backend_dev_name(dev), "CUDA%d", &dev_id);
+                if (lazy_buft && lazy_map && lazy_unmap && lazy_buft(dev_id)) {
+                    buft = lazy_buft(dev_id);
+                    lazy = true;
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -288,10 +305,18 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+            lazy && !ggml_backend_buffer_is_host(buf) ? " (lazily backed)" : "");
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (lazy) {
+        static std::atomic<uint64_t> next_id{1};
+        vram_id = next_id++;
+        std::lock_guard<std::mutex> lock(lazy_caches_mutex());
+        lazy_caches().push_back(this);
     }
 
     {
@@ -2808,9 +2833,15 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
+uint32_t llama_kv_cache_reserve_n_kv_cap = 0;
+llama_adaptive_ubatch llama_adaptive_ubatch_params;
+
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    if (llama_kv_cache_reserve_n_kv_cap > 0) {
+        n_kv = std::min<int32_t>(n_kv, (int32_t) GGML_PAD(llama_kv_cache_reserve_n_kv_cap, 256));
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2953,4 +2984,84 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+// ---- VRAM manager ----
+
+std::vector<llama_kv_cache *> & llama_kv_cache::lazy_caches() {
+    static std::vector<llama_kv_cache *> caches;
+    return caches;
+}
+
+std::mutex & llama_kv_cache::lazy_caches_mutex() {
+    static std::mutex mtx;
+    return mtx;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    std::lock_guard<std::mutex> lock(lazy_caches_mutex());
+    auto & c = lazy_caches();
+    c.erase(std::remove(c.begin(), c.end(), this), c.end());
+}
+
+uint32_t llama_kv_cache::vram_cells() const {
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    uint32_t res = 0;
+    for (const auto & cells : v_cells) {
+        res = std::max(res, std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))));
+    }
+    return res;
+}
+
+size_t llama_kv_cache::vram_bytes(uint32_t n) const {
+    size_t res = 0;
+    for (const auto & l : layers) {
+        for (const ggml_tensor * t : { l.k, l.v }) {
+            if (t != nullptr && t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer)) {
+                res += (size_t) n*t->nb[1];
+            }
+        }
+    }
+    return res;
+}
+
+bool llama_kv_cache::vram_map(uint32_t n) {
+    if (!lazy) {
+        return true;
+    }
+    for (const auto & l : layers) {
+        for (const ggml_tensor * t : { l.k, l.v }) {
+            if (t == nullptr || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t off = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+            // every stream's first n cells (the streams are the tensor's third dimension)
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                if (!lazy_map(t->buffer, off + (size_t) s*t->nb[2], std::min<size_t>((size_t) n*t->nb[1], t->nb[2]))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+size_t llama_kv_cache::vram_trim(uint32_t n) {
+    if (!lazy) {
+        return 0;
+    }
+    size_t freed = 0;
+    for (const auto & l : layers) {
+        for (const ggml_tensor * t : { l.k, l.v }) {
+            if (t == nullptr || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t off = (const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer);
+            for (int64_t s = 0; s < t->ne[2]; ++s) {
+                const size_t keep = std::min<size_t>((size_t) n*t->nb[1], t->nb[2]);
+                freed += lazy_unmap(t->buffer, off + (size_t) s*t->nb[2] + keep, t->nb[2] - keep);
+            }
+        }
+    }
+    return freed;
 }

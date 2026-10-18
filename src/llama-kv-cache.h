@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 struct llama_cparams;
@@ -16,6 +17,42 @@ struct llama_context;
 //
 // llama_kv_cache
 //
+
+// adaptive ubatch: when non-zero, the full-cache contexts used to reserve graphs see at most this many cells
+extern uint32_t llama_kv_cache_reserve_n_kv_cap;
+
+// adaptive ubatch: the largest ubatch (up to n_ubatch) whose size times the cells it will see stays within the budget
+struct llama_adaptive_ubatch {
+    uint32_t n_min  = 0; // 0: disabled
+    uint64_t budget = 0; // ubatch tokens x KV cells
+    // LLAMA_UBATCH_TEXT_FULL=1: token batches keep n_ubatch at any depth, their graphs build no ubatch x cells tensor (qwen4exp
+    // chunked QSA, see llm_graph_input_kpool::gen); batches of embeddings (images) still follow the budget
+    bool     text_full = false;
+    // LLAMA_UBATCH_TEXT_CTX=n (with text_full): token batches use the full n_ubatch only while they end within n cells, half of it
+    // beyond (2026-10-16: 8192-token batches read prompts 1.4x faster than 4096, but their activations, ~2.5 GiB, do not fit next
+    // to the KV cache of a deep context: OOM at 109k)
+    uint32_t text_ctx  = 0;
+    // set while reserving the graph of the smallest adaptive ubatch: it is built as for embeddings, with the full masks
+    bool     reserve_masks = false;
+    // the cells the largest ubatch sees within the budget (budget / n_ubatch): with text_full, chunked attention keeps
+    // chunk x cells within chunk x kv_ref, so that a full ubatch needs the compute memory it needed at that depth
+    uint32_t kv_ref = 0;
+
+    uint32_t get(uint32_t n_ubatch, uint32_t n_past, bool text = false) const {
+        if (text && text_full && text_ctx > 0 && n_past + n_ubatch > text_ctx && n_ubatch/2 >= n_min) {
+            return n_ubatch/2;
+        }
+        if (n_min == 0 || n_min >= n_ubatch || (text && text_full)) {
+            return n_ubatch;
+        }
+        uint32_t n = n_ubatch;
+        while (n > n_min && (uint64_t) n * (n_past + n) > budget) {
+            n /= 2;
+        }
+        return std::max(n, n_min);
+    }
+};
+extern llama_adaptive_ubatch llama_adaptive_ubatch_params;
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -116,7 +153,20 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
+
+    // ---- VRAM manager (LLAMA_VRAM_MANAGER=1, 2026-10-15): device buffers of KV caches are lazily backed (see
+    // ggml_backend_cuda_lazy_buffer_type); the manager maps the cells the next graph reads and gives back the rest
+    static std::vector<llama_kv_cache *> & lazy_caches(); // the caches with lazily backed buffers (with lazy_caches_mutex())
+    static std::mutex & lazy_caches_mutex();
+    // the cells the next graph may read: [0, n), as get_n_kv pads them
+    uint32_t vram_cells() const;
+    // maps the first n cells of every layer, false if the device ran out of memory
+    bool   vram_map(uint32_t n);
+    // gives back what lies beyond the first n cells, returns the bytes freed (no kernel may read them meanwhile)
+    size_t vram_trim(uint32_t n);
+    // bytes the first n cells occupy in the device buffers (granules not counted)
+    size_t vram_bytes(uint32_t n) const;
 
     //
     // llama_memory_i
@@ -297,6 +347,13 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    bool lazy = false; // device buffers lazily backed (VRAM manager)
+public:
+    uint64_t vram_id = 0; // unique per lazily backed cache (an address can be reused by a later cache)
+private:
+    bool (*lazy_map)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
+    size_t (*lazy_unmap)(ggml_backend_buffer_t, size_t, size_t) = nullptr;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

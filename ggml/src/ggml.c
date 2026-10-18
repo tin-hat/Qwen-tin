@@ -3424,6 +3424,34 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_reduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * w) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(as->ne[3] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(as->ne[0] == b->ne[0]);
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == ids->ne[0] && w->ne[2] == ids->ne[1]);
+
+    const int64_t ne[4] = { as->ne[1], 1, b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MUL_MAT_ID;
+    result->src[0] = as;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = w;
+    ggml_set_op_params_i32(result, 4, 1);
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

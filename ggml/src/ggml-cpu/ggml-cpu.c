@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#include "moe-stream.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -1647,6 +1648,9 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // hybrid MoE: the experts computed on another device are skipped, their rows are zero
+        const int32_t * gpu_map = ggml_moe_stream_gpu_map(src0);
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
@@ -1654,20 +1658,36 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 >= 0 && i02 < n_as);
 
+                if (gpu_map != NULL && gpu_map[i02] >= 0) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
     }
 
+    // with MoE streaming, the chunks are handed out dynamically: on hybrid CPUs, a static first chunk per thread waits for the slow cores
+    const bool stream_order = ggml_moe_stream_enabled() && n_as <= 1024;
+    const bool stream = stream_order;
+
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+        *current_chunk_ctr = stream ? 0 : nth;
     }
 
     ggml_barrier(params->threadpool);
 
+    // with MoE streaming, the experts whose reads are in flight are computed last
+    uint8_t visited[1024];
+    if (stream_order) {
+        memset(visited, 0, n_as);
+    }
+
+    for (int pass = 0; pass < (stream_order ? 2 : 1); ++pass)
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1675,12 +1695,19 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
+        if (stream_order) {
+            if (visited[cur_a] || (pass == 0 && !ggml_moe_stream_ready(src0, cur_a))) {
+                continue;
+            }
+            visited[cur_a] = 1;
+        }
+
         // tiled takes over if profitable for this expert (see tiled.h)
         if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = ggml_moe_stream_expert(src0, cur_a);
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1688,7 +1715,7 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t nr1 = cne1;
 
         int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
+        if ((nr0 == 1 || nr1 == 1) && !stream) {
             chunk_size = 64;
         }
 
@@ -1698,7 +1725,7 @@ static void ggml_compute_forward_mul_mat_id(
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+        if ((nchunk0 * nchunk1 < nth * 4 && !stream) || disable_chunking) {
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
@@ -1706,9 +1733,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        int current_chunk = ith;
-
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+
+        int current_chunk = stream ? atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) : ith;
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
@@ -1726,7 +1753,7 @@ static void ggml_compute_forward_mul_mat_id(
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
 
-            if (nth >= nchunk0 * nchunk1) {
+            if (nth >= nchunk0 * nchunk1 && !stream) {
                 break;
             }
 
@@ -1868,6 +1895,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
+                GGML_ASSERT(ggml_get_op_params_i32(tensor, 4) == 0 && "ggml_mul_mat_id_reduce runs only on the GPU (mmid-stream)");
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
@@ -3098,6 +3126,32 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+
+// GGML_CPU_OP_PROFILE=1: thread 0 accumulates the wall time of each op type, printed every 20000 graphs
+static int64_t ggml_cpu_prof_us[GGML_OP_COUNT];
+static int64_t ggml_cpu_prof_n[GGML_OP_COUNT];
+static int64_t ggml_cpu_prof_graphs;
+static int64_t ggml_cpu_prof_graph_us;
+static int64_t ggml_cpu_prof_barrier_us;
+static int64_t ggml_cpu_prof_start_us;
+static int64_t ggml_cpu_prof_graph_t0;
+static int ggml_cpu_prof_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * s = getenv("GGML_CPU_OP_PROFILE");
+        enabled = s != NULL && atoi(s) != 0;
+    }
+    return enabled;
+}
+static void ggml_cpu_prof_print(void) {
+    fprintf(stderr, "ggml_cpu_prof: %lld graphs\n", (long long) ggml_cpu_prof_graphs);
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        if (ggml_cpu_prof_n[i] > 0) {
+            fprintf(stderr, "ggml_cpu_prof: %-20s %10lld calls %10.1f ms\n", ggml_op_name((enum ggml_op) i), (long long) ggml_cpu_prof_n[i], ggml_cpu_prof_us[i]/1000.0);
+        }
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3126,6 +3180,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+#if defined(__linux__)
+    const struct ggml_tensor * moe_prefetch_ids = NULL;
+#endif
+    bool prof_first = state->ith == 0 && ggml_cpu_prof_enabled();
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3138,13 +3197,42 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+#if defined(__linux__)
+        if (state->ith == 0 && node->op == GGML_OP_MUL_MAT_ID) {
+            if (ggml_moe_stream_enabled()) {
+                if (node->src[2] != moe_prefetch_ids) {
+                    moe_prefetch_ids = node->src[2];
+                    const int64_t t0 = ggml_cpu_prof_enabled() ? ggml_time_us() : 0;
+                    ggml_moe_stream_prepare(cgraph, node_n);
+                    if (t0 != 0) {
+                        // reported as NONE
+                        ggml_cpu_prof_us[GGML_OP_NONE] += ggml_time_us() - t0;
+                        ggml_cpu_prof_n[GGML_OP_NONE]++;
+                    }
+                }
+            }
+        }
+#endif
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const int64_t prof_t0 = (state->ith == 0 && ggml_cpu_prof_enabled()) ? ggml_time_us() : 0;
+        if (prof_first) {
+            prof_first = false;
+            ggml_cpu_prof_start_us += prof_t0 - ggml_cpu_prof_graph_t0;
+        }
+        const enum ggml_op prof_op = node->op;
+
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (prof_t0 != 0) {
+            ggml_cpu_prof_us[prof_op] += ggml_time_us() - prof_t0;
+            ggml_cpu_prof_n[prof_op]++;
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3154,7 +3242,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
+            const int64_t tb = prof_t0 != 0 ? ggml_time_us() : 0;
             ggml_barrier(state->threadpool);
+            if (tb != 0) {
+                ggml_cpu_prof_barrier_us += ggml_time_us() - tb;
+            }
         }
     }
 
@@ -3389,6 +3481,8 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    const int64_t prof_g0 = ggml_cpu_prof_enabled() ? ggml_time_us() : 0;
+    ggml_cpu_prof_graph_t0 = prof_g0;
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);
@@ -3460,6 +3554,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);
+    }
+
+    if (prof_g0 != 0) {
+        ggml_cpu_prof_us[GGML_OP_COUNT - 1] += 0; // keep the array in bounds
+        ggml_cpu_prof_graph_us += ggml_time_us() - prof_g0;
+        if (++ggml_cpu_prof_graphs % 4800 == 0) {
+            fprintf(stderr, "ggml_cpu_prof: graph wall %.1f ms, thread 0 in end-of-node barriers %.1f ms, graph start to first node %.1f ms\n", ggml_cpu_prof_graph_us/1000.0, ggml_cpu_prof_barrier_us/1000.0, ggml_cpu_prof_start_us/1000.0);
+            ggml_cpu_prof_print();
+        }
     }
 
     return ret;

@@ -1617,3 +1617,13 @@ void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// MUL_MAT_ID over the experts held in a chunk buffer x (n_slots experts of type, ne00 x ne01, strides nb01 and nb02):
+// ids_local (contiguous [n_expert_used, n_tokens]) holds each (token, slot)'s position in x, values >= n_slots are skipped;
+// n_rows is the number of (token, slot) pairs in the chunk. Only their rows of dst are written (see mmid-stream.cu).
+// With compact_dst, the rows go to compact_dst instead, row r (of ne01 floats) for the r-th pair in expert order, and
+// ids_dst_out[r] receives that pair's index (token*n_expert_used + slot); dst only provides the shapes
+void ggml_cuda_mul_mat_q_ids_chunk(
+        ggml_backend_cuda_context & ctx, ggml_type type, const char * x, int64_t ne00, int64_t ne01, int64_t n_slots, size_t nb01, size_t nb02,
+        const ggml_tensor * src1, const int32_t * ids_local, int64_t n_expert_used, int64_t n_tokens, int64_t n_rows, ggml_tensor * dst,
+        float * compact_dst = nullptr, int32_t * ids_dst_out = nullptr);

@@ -242,7 +242,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const size_t shared_mem     = ncols_pad * sizeof(int);
     const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
     const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    // the pool holds ~5 chunk-sized buffers while a chunk is sorted; with 64 MB chunks a sparse-attention indexer
+    // (n_kv/4 columns x 512 query rows) needed ~300 MiB of scratch at 110k context, which no longer fit next to the
+    // CUDA graphs of a 7.7 GB card; rows are sorted independently, so smaller chunks give the same result
+    static const size_t chunk_bytes = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_CHUNK_MIB");
+        return (size_t) (e ? atoi(e) : 8) << 20;
+    }();
+    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows, chunk_bytes);
 
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
     int *                     tmp_dst = temp_dst_alloc.get();

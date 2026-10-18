@@ -2562,7 +2562,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * sel,
                         int64_t   n_sel,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                          // chunked (sel == nullptr): the mask rows of tokens [t0, t0 + nt) for each chunk of queries
+                          const std::function<ggml_tensor * (int64_t t0, int64_t nt)> & sel_rows = nullptr,
+                        int64_t   chunk = 0,
+                          // gathered (small batches): attend to the selected cells only, see build_qsa_sel_rows
+                    ggml_tensor * g_idx  = nullptr,
+                    ggml_tensor * g_live = nullptr);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
@@ -2575,7 +2581,24 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                    // chunked: only the indexer keys are stored, the indexer query and keys are returned for build_qsa_sel_rows
+                    ggml_tensor ** idx_q = nullptr,
+                    ggml_tensor ** idx_k = nullptr);
+
+        // QSA mask rows [n_kv, nt] of the tokens [t0, t0 + nt) from the indexer query and keys of build_qsa_sel
+        // g_idx/g_live set: no mask, return the selected cells [n_sel, nt] (I32, n_kv for dead slots) and
+        // whether each slot is live (F32 1/0) instead
+        ggml_tensor * build_qsa_sel_rows(
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * q,
+                    ggml_tensor * pooled,
+                    ggml_tensor * kq_mask,
+                        int64_t   t0,
+                        int64_t   nt,
+                            int   il,
+                    ggml_tensor ** g_idx  = nullptr,
+                    ggml_tensor ** g_live = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

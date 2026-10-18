@@ -1,0 +1,5 @@
+set(TARGET llama-kldapi)
+add_executable(${TARGET} kldapi.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama llama-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

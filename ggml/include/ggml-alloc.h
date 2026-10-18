@@ -72,6 +72,12 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+// the backend buffer of buffer_id if it is a single chunk, NULL otherwise
+GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
+// the end of the tensors that the last ggml_gallocr_alloc_graph placed in buffer_id (SIZE_MAX if it has several chunks)
+GGML_API size_t ggml_gallocr_get_buffer_hwm(ggml_gallocr_t galloc, int buffer_id);
+// the next reserve allocates buffer_id (if it is one chunk) with at least size bytes
+GGML_API void ggml_gallocr_set_buffer_min_size(ggml_gallocr_t galloc, int buffer_id, size_t size);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

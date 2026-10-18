@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Qwen-tin: Qwen3.8-Flash-Next GSQ-RCO IQ3_S (84 GB) with its experts streamed from NVMe, as an OpenAI-compatible server on
+# http://$HOST:$PORT (default 127.0.0.1:8080). Extra arguments go to llama-server. Tuned on an 8 GB RTX 5060 Laptop GPU,
+# 32 GB RAM and an i9-13900H; see README.md for what each setting does.
+# Env: QWEN_TIN_MODELS (models dir of setup.sh), HOST, PORT, CTX (default 153600), CACHE_MIB (RAM expert cache, default
+#      RAM - 6.25 GiB), VRAM_EXPERTS_MIB (GPU expert banks at most, default VRAM - 4 GiB), THREADS, CPU_MASK, IO_CPUS
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=$(dirname "$here")
+M=${QWEN_TIN_MODELS:-$repo/models/Qwen3.8-Flash-Next}
+BIN=${QWEN_TIN_BIN:-$repo/build/bin/llama-server}
+S1=Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+[ -x "$BIN" ] || die "$BIN not found - run qwen-tin/setup.sh first"
+if [ -f "$M/IQ3_S-hcq8/$S1" ]; then model="$M/IQ3_S-hcq8/$S1"
+elif [ -f "$M/IQ3_S/$S1" ]; then model="$M/IQ3_S/$S1"
+else die "no model in $M - run qwen-tin/setup.sh (or set QWEN_TIN_MODELS)"; fi
+if pgrep -x llama-server >/dev/null; then
+    die "another llama-server is running; this model needs the whole GPU and most of the RAM"
+fi
+ulimit -c 0  # a core dump of a process this size can exhaust the RAM of the machine
+
+mem_mib=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 2>/dev/null | head -1 || echo 8192)
+CACHE_MIB=${CACHE_MIB:-$(( (mem_mib - 6400) / 256 * 256 ))}
+VRAM_EXPERTS_MIB=${VRAM_EXPERTS_MIB:-$(( vram_mib - 4096 ))}
+[ "$CACHE_MIB" -ge 4096 ] || die "RAM expert cache of $CACHE_MIB MiB: this needs a machine with at least 16 GB of RAM"
+
+# CPU: the compute threads busy-wait, so they get cores of their own and the SSD readers get the rest. Hybrid Intel CPUs
+# (P-core threads numbered first): all P-core threads + half of the E-cores compute, the E-cores read (13900H: 16 / 12-19).
+cpu_args=()
+range_n() { awk -F, '{ n = 0; for (i = 1; i <= NF; i++) { split($i, r, "-"); n += (r[2] == "" ? 1 : r[2] - r[1] + 1) } print n }' "$1"; }
+if [ -r /sys/devices/cpu_core/cpus ] && [ -r /sys/devices/cpu_atom/cpus ]; then
+    p=$(range_n /sys/devices/cpu_core/cpus); e=$(range_n /sys/devices/cpu_atom/cpus)
+    THREADS=${THREADS:-$(( p + e / 2 ))}
+    CPU_MASK=${CPU_MASK:-$(printf '0x%X' $(( (1 << THREADS) - 1 )))}
+    IO_CPUS=${IO_CPUS:-$(cat /sys/devices/cpu_atom/cpus)}
+else
+    THREADS=${THREADS:-$(lscpu -p=core,socket | grep -v '^#' | sort -u | wc -l)}
+fi
+[ -n "${CPU_MASK:-}" ] && cpu_args=(--cpu-mask "$CPU_MASK" --cpu-strict 1)
+[ -n "${IO_CPUS:-}" ] && export GGML_MOE_STREAM_IO_CPUS=$IO_CPUS
+
+mmproj_args=()
+if [ -f "$M/mmproj-Qwen3.8-Flash-Next-Q5mix.gguf" ]; then
+    mmproj_args=(--mmproj "$M/mmproj-Qwen3.8-Flash-Next-Q5mix.gguf" --no-mmproj-offload --image-min-tokens 256 --image-max-tokens 1024)
+fi
+echo "qwen-tin: $(basename "$(dirname "$model")"), RAM cache $CACHE_MIB MiB, GPU experts up to $VRAM_EXPERTS_MIB MiB, $THREADS threads${CPU_MASK:+ (mask $CPU_MASK)}${IO_CPUS:+, readers on CPUs $IO_CPUS}" >&2
+
+# experts: RAM cache + O_DIRECT reads, 16 readers; a governor shrinks the cache to leave the machine 2 GiB of MemAvailable
+export GGML_MOE_STREAM_MIB=$CACHE_MIB
+export GGML_MOE_STREAM_IO_THREADS=16
+export GGML_MOE_STREAM_LOG=1
+export GGML_MOE_STREAM_RESERVE_MIB=1536
+# GPU: the KV cache and the compute buffer hold only what they use, the experts generation uses most take the rest
+export LLAMA_VRAM_MANAGER=1
+export LLAMA_MOE_VRAM_MIB=$VRAM_EXPERTS_MIB
+# prompts: experts stream to the GPU through a 144 MiB ring; batches under 256 tokens are computed like generation
+export LLAMA_MOE_PREFILL_STREAM_MIB=144
+export GGML_OP_OFFLOAD_MIN_BATCH=256
+export LLAMA_MOE_VRAM_MAX_TOKENS=255
+# prompt batches of 8192 tokens up to 128k of context, 4096 beyond; sparse attention in chunks of 512 queries
+export LLAMA_UBATCH_MIN=1024
+export LLAMA_UBATCH_TEXT_FULL=1
+export LLAMA_UBATCH_TEXT_CTX=131072
+export LLAMA_QSA_CHUNK=512
+# generation attends to the cells the sparse indexer selects once the context holds 1.2x that many
+export LLAMA_QSA_GATHER_RATIO=1.2
+export GGML_CUDA_REGISTER_HOST=1
+export OMP_WAIT_POLICY=active
+export GOMP_SPINCOUNT=2000000
+
+exec "$BIN" \
+    --model "$model" "${mmproj_args[@]}" \
+    --alias qwen3.8-flash-next \
+    --load-mode mmap --lazy-mode on --no-repack \
+    --n-gpu-layers 99 --cpu-moe \
+    --ctx-size "${CTX:-153600}" --cache-type-k q5_0 --cache-type-v q4_0 --flash-attn on \
+    --threads "$THREADS" "${cpu_args[@]}" \
+    --parallel 1 --batch-size 8192 --ubatch-size 8192 \
+    --cache-ram 0 --ctx-checkpoints 3 \
+    --no-warmup --jinja \
+    --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
+    --metrics --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" "$@"

@@ -22,6 +22,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 class llama_moe_cache;
+class llama_moe_vram;
 
 struct llama_memory_context_i;
 
@@ -144,6 +145,7 @@ public:
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
 
     float scale_tok = 1.0f;
+    bool  tok_only  = false; // a large token batch: only the token path was built (see build_inp_embd)
 
     const int64_t n_embd = 0;
 };
@@ -796,6 +798,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    llama_moe_vram               * moe_vram = nullptr;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1040,6 +1043,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    llama_moe_vram               * moe_vram;
 
     const llama_prec_policy * prec_policy;
 
@@ -1051,6 +1055,13 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // optional: maps the selected experts of layer il to the ids used by the expert matmuls (e.g. to run a CPU op in their split)
+    std::function<ggml_tensor * (ggml_tensor * selected_experts, int il)> moe_ids_hook;
+
+    // optional: called by build_moe_ffn after the device branch of the hybrid MoE (llama-moe-vram), so that device work that does not
+    // need the routed experts (e.g. a shared expert) runs while the CPU computes them; returns true if it was called
+    std::function<void ()> moe_device_hook;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

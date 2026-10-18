@@ -75,6 +75,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+    // adaptive ubatch: the cells already used, the size of each split depends on how many cells it will see
+    uint32_t n_past = 0;
+    if (llama_adaptive_ubatch_params.n_min > 0) {
+        for (llama_seq_id s = 0; s < (llama_seq_id) get_mem_attn()->get_n_seq_max(); ++s) {
+            n_past = std::max<uint32_t>(n_past, (uint32_t) (get_mem_attn()->seq_pos_max(s) + 1));
+        }
+    }
+
     do {
         balloc.split_reset();
 
@@ -83,10 +91,12 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
         while (true) {
             llama_ubatch ubatch;
+            const uint32_t n_ub = llama_adaptive_ubatch_params.get(n_ubatch, n_past + (uint32_t) balloc.get_n_used(),
+                balloc.get_batch().embd == nullptr);
 
             if (embd_all) {
                 // if all tokens are output, split by sequence
-                ubatch = balloc.split_seq(n_ubatch);
+                ubatch = balloc.split_seq(n_ub);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (get_mem_attn()->get_n_stream() == 1);
@@ -96,7 +106,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ub, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -736,11 +746,18 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
+        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * pool_nv) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_idxs->buffer));
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool_mask->buffer));
+    // the graph builds the pool mask from pool_nv instead when pool_mask is not allocated
+    if (pool_mask->buffer == nullptr) {
+        GGML_ASSERT(pool_nv != nullptr && pool_nv->type == GGML_TYPE_F32 && pool_nv->ne[0] == (int64_t) ubatch->n_tokens);
+        GGML_ASSERT(ggml_backend_buffer_is_host(pool_nv->buffer));
+        pool_mask = nullptr;
+    } else {
+        GGML_ASSERT(ggml_backend_buffer_is_host(pool_mask->buffer));
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(tail_idxs->buffer));
 
     const uint32_t kpool = mem->get_kpool();
@@ -759,7 +776,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -922,14 +939,22 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
+            T * row = data != nullptr ? data + (size_t) i*n_pool : nullptr;
+            if (row != nullptr) {
+                std::fill(row, row + n_pool, drop);
+            }
 
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+            if (row != nullptr) {
+                std::fill(row + p0, row + p0 + nv, keep);
+            } else {
+                // the visible pools of token i are [0, nv): a single sequence, p0 == 0 (see llm_graph_input_kpool::gen)
+                GGML_ASSERT(p0 == 0);
+                ((float *) pool_nv->data)[i] = (float) nv;
+            }
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
@@ -940,7 +965,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (pool_mask == nullptr) {
+        fill_mask((ggml_fp16_t *) nullptr);
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);

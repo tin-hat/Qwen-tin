@@ -439,6 +439,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    // the summed variant (ggml_mul_mat_id_reduce) runs only where the experts are streamed to the GPU
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 4) == 1) {
+        return false;
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:

@@ -1,8 +1,11 @@
 #include "llama-graph.h"
 
+#include "ggml-cpu.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-vram.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -133,6 +136,7 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     res &= (!mixed_tokens) || mixed_tokens->ne[0] == llm_graph_n_tok_rows(params.ubatch);
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
     res &= (!scale_rows) || scale_rows->ne[1] == params.ubatch.n_tokens;
+    res &= !tok_only || (params.ubatch.token && !params.ubatch.embd);
 
     return res;
 }
@@ -1128,7 +1132,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no op reads it (qwen4exp's chunked QSA of token batches does without)
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1525,6 +1532,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_vram         (params.moe_vram),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2003,6 +2011,31 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// hybrid MoE (llama-moe-vram): the CPU's share of the experts of each token, weighted and summed in slot order, so that the device
+// receives one row per token instead of one per expert (its own experts are summed by the device branch)
+// src[0]: experts [n_embd, n_expert_used, n_tokens] (the rows of device experts are zero), src[1]: weights [1, n_expert_used, n_tokens]
+static void llm_moe_cpu_weighted_sum(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+    const ggml_tensor * e = dst->src[0];
+    const ggml_tensor * w = dst->src[1];
+    const int64_t n_embd = e->ne[0], n_used = e->ne[1], n_tokens = e->ne[2];
+    const int64_t per = (n_embd + nth - 1)/nth;
+    const int64_t c0  = std::min<int64_t>(n_embd, ith*per), c1 = std::min<int64_t>(n_embd, c0 + per);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        float * d = (float *) ((char *) dst->data + t*dst->nb[2]);
+        for (int64_t c = c0; c < c1; ++c) {
+            d[c] = 0.0f;
+        }
+        for (int64_t s = 0; s < n_used; ++s) {
+            const float ws = *(const float *) ((const char *) w->data + s*w->nb[1] + t*w->nb[2]);
+            const float * r = (const float *) ((const char *) e->data + s*e->nb[1] + t*e->nb[2]);
+            for (int64_t c = c0; c < c1; ++c) {
+                d[c] += ws*r[c];
+            }
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2214,7 +2247,72 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    // the ids of the expert matmuls
+    ggml_tensor * mm_ids = moe_ids_hook ? moe_ids_hook(selected_experts, il) : selected_experts;
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    auto moe_cpu_sum_on = [&](const ggml_tensor * down_b, int il_) {
+        static const bool cpu_sum = [] { const char * e = getenv("LLAMA_MOE_CPU_SUM"); return e == nullptr || atoi(e) != 0; }();
+        return cpu_sum && down_b == nullptr && hparams.n_expert_used(il_) > 1;
+    };
+
+    // hybrid MoE (llama-moe-vram): the device computes the experts it caches while the CPU computes the others
+    ggml_tensor * vram_down = nullptr;
+    ggml_tensor * vram_sum  = nullptr; // the device's experts weighted and summed (LLAMA_MOE_CPU_SUM)
+    if (moe_vram != nullptr && slots == nullptr && !weight_before_ffn && gate_exps != nullptr && gate_up_exps == nullptr &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU &&
+            !(il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) && moe_vram->active(il, n_tokens) &&
+            moe_vram->get_experts(up_exps) && moe_vram->get_experts(gate_exps) && moe_vram->get_experts(down_exps)) {
+        // a CPU op that records the experts and reads cur, so that the scheduler copies cur to the CPU before the device branch:
+        // the CPU split of the expert matmuls then needs nothing from the device and runs while the device computes its experts
+        // (with LLAMA_MOE_CPU_SUM it reads the weights too, for the CPU's weighted sum)
+        if (moe_cpu_sum_on(down_exps_b, il)) {
+            mm_ids = ggml_map_custom3(ctx0, mm_ids, cur, weights, llama_moe_vram::pre_op3, 1, moe_vram->pre_userdata(il));
+        } else {
+            mm_ids = ggml_map_custom2(ctx0, mm_ids, cur, llama_moe_vram::pre_op, 1, moe_vram->pre_userdata(il));
+        }
+        cb(mm_ids, "ffn_moe_vram_ids", il);
+        ggml_build_forward_expand(gf, mm_ids);
+
+        ggml_tensor * sel = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+        ggml_tensor * vslots = ggml_get_rows(ctx0, moe_vram->get_slot_map(il), ggml_reshape_1d(ctx0, sel, ggml_nelements(sel)));
+        ggml_backend_sched_set_tensor_backend(sched, vslots, moe_vram->backend());
+        vslots = ggml_reshape_2d(ctx0, vslots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens], -1: CPU
+        cb(vslots, "ffn_moe_vram_slots", il);
+
+        ggml_tensor * vup   = ggml_mul_mat_id(ctx0, moe_vram->get_experts(up_exps),   cur, vslots);
+        ggml_tensor * vgate = ggml_mul_mat_id(ctx0, moe_vram->get_experts(gate_exps), cur, vslots);
+        ggml_tensor * vact  = ggml_swiglu_split(ctx0, vgate, vup);
+        cb(vact, "ffn_moe_vram_swiglu", il);
+        vram_down = ggml_mul_mat_id(ctx0, moe_vram->get_experts(down_exps), vact, vslots);
+        cb(vram_down, "ffn_moe_vram_down", il);
+        // the banks may be in a compute buffer, which does not pull the ops to the device like weights do
+        for (ggml_tensor * t : { vup, vgate, vact, vram_down }) {
+            ggml_backend_sched_set_tensor_backend(sched, t, moe_vram->backend());
+        }
+        ggml_build_forward_expand(gf, vram_down);
+        // LLAMA_MOE_CPU_SUM (default 1): each side weights and sums its own experts, the device's in this branch (while the CPU
+        // computes), and the CPU sends one summed row per token instead of a row per expert (100 KB -> 10 KB per layer)
+        if (moe_cpu_sum_on(down_exps_b, il)) {
+            ggml_tensor * vw = ggml_mul(ctx0, vram_down, weights);
+            ggml_backend_sched_set_tensor_backend(sched, vw, moe_vram->backend());
+            for (uint32_t i = 0; i < hparams.n_expert_used(il); ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx0, vw, n_embd, n_tokens, vw->nb[2], i*vw->nb[1]);
+                if (vram_sum == nullptr) {
+                    vram_sum = v;
+                } else {
+                    vram_sum = ggml_add(ctx0, vram_sum, v);
+                    ggml_backend_sched_set_tensor_backend(sched, vram_sum, moe_vram->backend());
+                }
+            }
+            cb(vram_sum, "ffn_moe_vram_sum", il);
+            ggml_build_forward_expand(gf, vram_sum);
+        }
+        if (moe_device_hook) {
+            moe_device_hook();
+        }
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2228,7 +2326,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, mm_ids, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2236,7 +2334,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, mm_ids);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2247,7 +2345,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, mm_ids, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2255,12 +2353,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = ggml_add_id(ctx0, up, up_exps_b, mm_ids);
             cb(up, "ffn_moe_up_biased", il);
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, mm_ids, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2271,7 +2369,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = ggml_add_id(ctx0, cur, gate_exps_b, mm_ids);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2361,20 +2459,77 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+    // prompt batches whose experts stream to the GPU: the down projection weights and sums the experts of each token itself, chunk
+    // by chunk (ggml_mul_mat_id_reduce, mmid-stream.cu), instead of keeping a [n_embd, n_expert_used, n_tokens] tensor (100 KB per
+    // token for qwen4exp, the largest part of the compute buffer: 0.8 GB at 8192-token batches); LLAMA_MOE_REDUCE=0 disables
+    {
+        static const bool reduce_on = [] { const char * e = getenv("LLAMA_MOE_REDUCE"); return e == nullptr || atoi(e) != 0; }();
+        static const int64_t offload_min = [] { const char * e = getenv("GGML_OP_OFFLOAD_MIN_BATCH"); return e ? (int64_t) atoll(e) : (int64_t) 32; }();
+        if (reduce_on && !weight_before_ffn && slots == nullptr && vram_down == nullptr && !down_exps_s && !down_exps_b &&
+                loras->empty() && arch != LLM_ARCH_MISTRAL4 && n_tokens >= std::max<int64_t>(offload_min, 256) &&
+                hparams.n_expert_used(il) > 1 && ggml_moe_stream_enabled() && down_exps->buffer != nullptr &&
+                ggml_backend_buffer_is_host(down_exps->buffer)) {
+            ggml_tensor * moe_out = ggml_mul_mat_id_reduce(ctx0, down_exps, cur, mm_ids, weights); // [n_embd, 1, n_tokens]
+            if (prec_policy) {
+                prec_policy->apply(moe_out);
+            }
+            moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
+    }
+
+    experts = build_lora_mm_id(down_exps, cur, mm_ids, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
 
+    if (vram_sum != nullptr) {
+        ggml_tensor * args[2] = { experts, weights };
+        ggml_tensor * csum = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, 1, n_tokens, 1, args, 2, llm_moe_cpu_weighted_sum, GGML_N_TASKS_MAX, nullptr);
+        cb(csum, "ffn_moe_cpu_sum", il);
+        ggml_tensor * moe_out = ggml_add(ctx0, vram_sum, ggml_reshape_2d(ctx0, csum, n_embd, n_tokens));
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, moe_vram->backend());
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
+    if (vram_down != nullptr) {
+        // each expert's rows come from one side, the other side's are zero
+        experts = ggml_add(ctx0, vram_down, experts);
+        ggml_backend_sched_set_tensor_backend(sched, experts, moe_vram->backend());
+        cb(experts, "ffn_moe_down_hybrid", il);
+    }
+
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = ggml_add_id(ctx0, experts, down_exps_b, mm_ids);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    // prompt batches weight one expert slot at a time and add it to the sum: the weighted [n_embd, n_expert_used, n_tokens] tensor
+    // was the largest part of their compute buffer (100 KB per token for qwen4exp, 0.8 GB of 3.6 GB at 8192-token batches); the
+    // same products are added in the same order. (Weighting in place instead changed the results: the views of the in-place
+    // product let the allocator put the first sum over expert rows still to be added.)
+    const bool weight_per_slot = !weight_before_ffn && n_tokens >= 256 && vram_down == nullptr && hparams.n_expert_used(il) > 1 &&
+        down_exps_b == nullptr;
+    if (weight_per_slot) {
+        ggml_build_forward_expand(gf, experts);
+        ggml_tensor * moe_out = nullptr;
+        for (uint32_t i = 0; i < hparams.n_expert_used(il); ++i) {
+            ggml_tensor * e = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+            ggml_tensor * w = ggml_view_2d(ctx0, weights, 1, n_tokens, weights->nb[2], i*weights->nb[1]);
+            ggml_tensor * we = ggml_mul(ctx0, e, w);
+            moe_out = moe_out ? ggml_add(ctx0, moe_out, we) : we;
+            ggml_build_forward_expand(gf, moe_out);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
     }
 
     if (!weight_before_ffn) {
@@ -2471,9 +2626,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-    cb(inp->embd, "inp_embd", -1);
-    ggml_set_input(inp->embd);
+    // large token batches (prompts) build the token path only: the embedding and mixed paths that let one graph serve any batch
+    // contents took four more [n_embd, n_tokens] host tensors (320 MiB of pinned RAM at 8192 tokens), and these graphs are not
+    // reused for other contents anyway
+    inp->tok_only = ubatch.token != nullptr && ubatch.embd == nullptr && !ubatch.is_mixed() && ubatch.n_tokens >= 256 &&
+        loras->empty() && hparams.f_embedding_scale == 0.0f && tok_scale == 1.0f;
+
+    if (!inp->tok_only) {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+        cb(inp->embd, "inp_embd", -1);
+        ggml_set_input(inp->embd);
+    }
 
     // token embeddings with lora and padding
     auto build_tok = [&](ggml_tensor * ids) {
@@ -2507,6 +2670,18 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // select one of the 3 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550
     std::array<ggml_tensor *, 3> inps = {};
+
+    if (inp->tok_only) {
+        ggml_tensor * cur = build_tok(inp->tokens);
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+        res->t_inp_embd = cur;
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
 
     // token embeddings path (ubatch.token != nullptr)
     inps[0] = build_tok(inp->tokens);

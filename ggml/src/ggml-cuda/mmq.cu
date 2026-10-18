@@ -315,6 +315,107 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
+static __global__ void mmq_ids_iota(int32_t * __restrict__ ids, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        ids[i] = i;
+    }
+}
+
+void ggml_cuda_mul_mat_q_ids_chunk(
+        ggml_backend_cuda_context & ctx, ggml_type type, const char * x, int64_t ne00, int64_t ne01, int64_t n_slots, size_t nb01, size_t nb02,
+        const ggml_tensor * src1, const int32_t * ids_local, int64_t n_expert_used, int64_t n_tokens, int64_t n_rows, ggml_tensor * dst,
+        float * compact_dst, int32_t * ids_dst_out) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src1->ne[3] == 1 && dst->ne[3] == 1);
+    GGML_ASSERT((compact_dst != nullptr) == (ids_dst_out != nullptr));
+    GGML_ASSERT(compact_dst != nullptr || (dst->ne[1] == n_expert_used && dst->ne[2] == n_tokens));
+    GGML_ASSERT(src1->ne[2] == n_tokens);
+    GGML_ASSERT(src1->nb[2] % src1->nb[1] == 0);
+    GGML_ASSERT(dst->nb[2] % dst->nb[1] == 0);
+    if (n_rows == 0) {
+        return;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const size_t ts_src0 = ggml_type_size(type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = compact_dst ? compact_dst : (float *) dst->data;
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    const int64_t s01 = nb01 / ts_src0;
+    const int64_t s1  = compact_dst ? ne01 : (int64_t) (dst->nb[1] / ts_dst);
+    const int64_t s02 = nb02 / ts_src0;
+    const int64_t s2  = dst->nb[2] / ts_dst;
+    const int64_t s3  = dst->nb[3] / ts_dst;
+
+    const bool fallback = ne01 % 128 != 0;
+
+    ggml_tensor src0_desc = {};
+    src0_desc.type = type;
+    const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(&src0_desc, dst, cc);
+    GGML_ASSERT(prec_src1 == GGML_PREC_Q8);
+
+    const int64_t ne_get_rows = n_tokens * n_expert_used;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), n_slots + 1);
+
+    const int64_t n_rows_q = n_rows;
+    {
+        const int si1  = n_expert_used;
+        const int sis1 = src1->nb[2] / src1->nb[1];
+        ggml_cuda_launch_mm_ids_helper(ids_local, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            n_slots, n_tokens, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (compact_dst) {
+        // the rows of the chunk's pairs only, in the order MMQ computes them
+        CUDA_CHECK(cudaMemcpyAsync(ids_dst_out, ids_dst.get(), n_rows*sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+        mmq_ids_iota<<<(n_rows + 255)/256, 256, 0, stream>>>(ids_dst.get(), (int) n_rows);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const size_t nbytes_src1_q8_1 = ne_get_rows*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        ggml_cuda_mmq_get_J_max(type, fallback, cc, n_tokens) * sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        // only the compact rows of this chunk's experts
+        quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), type, ne10, s11, s12, s13,
+                               ne10_padded, n_rows_q, 1, 1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    const int64_t s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13 = n_tokens*s12;
+
+    // the quantized rows of the chunk are laid out with n_rows as their column stride (quantize_mmq_q8_1)
+    const mmq_args args = {
+        x, type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        nullptr,
+        ne00, ne01, n_rows_q, s01, n_rows_q, s1,
+        n_slots, n_slots, s02, s12, s2,
+        1, 1, 0, s13, s3,
+        n_tokens, n_tokens};
+
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
